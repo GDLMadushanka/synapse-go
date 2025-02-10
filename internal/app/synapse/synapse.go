@@ -15,7 +15,6 @@ package synapse
 
 import (
 	"context"
-	"fmt"
 	"runtime"
 	"sync"
 
@@ -59,6 +58,7 @@ func Run(ctx context.Context) error {
 	// waiting for OS singals to shutdown
 
 	<-ctx.Done()
+	// fmt.Println("\nReceived shutdown signal, cleaning up...") need to write cleaning up process
 	wg.Wait()
 	consolelogger.InfoLog("Server stopped")
 	return nil
