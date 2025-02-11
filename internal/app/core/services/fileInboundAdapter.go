@@ -41,11 +41,12 @@ type FileInboundAdapter struct {
 }
 
 func (adapter *FileInboundAdapter) PollFile(ctx context.Context) error {
+	consolelogger.InfoLog("PollFile called")
 	waitgroup := ctx.Value("waitGroup").(*sync.WaitGroup)
 	defer waitgroup.Done()
 
 	var wgChild sync.WaitGroup
-	newCtx := context.WithValue(ctx, "waitGroup", wgChild)
+	newCtx := context.WithValue(ctx, "waitGroup", &wgChild)
 
 	if adapter.inbound.Protocol == "file" {
 
@@ -89,47 +90,43 @@ func (adapter *FileInboundAdapter) PollFile(ctx context.Context) error {
 			return errors.New("file name pattern parameter not found")
 		}
 
-		ticker := time.NewTicker(time.Duration(interval) * time.Second) // Ensures precise polling
-		defer ticker.Stop()
+		ticker := time.NewTicker(time.Duration(interval) * time.Millisecond)
+		defer ticker.Stop()  // Ensures cleanup
 
-		for range ticker.C {
+		consolelogger.InfoLog("Starting file polling loop")
+
+		for {
+			consolelogger.InfoLog("Polling event")
 			select {
-			case <-ctx.Done():
-				fmt.Println("Cleaning up file polling gracefully")
-				consolelogger.InfoLog("Cleaning up file polling gracefully")
-				waitgroup.Done()
-				return nil
-			default:
+			case t := <-ticker.C:
+				consolelogger.InfoLog(fmt.Sprintf("Polling event at: %v", t))
 				startTime := time.Now()
-				consolelogger.DebugLog("\n--- Start new Polling Event ---")
-		
-				// Process failed_files.txt if available
+
 				processFailedFiles(fileURI, moveAfterFailure)
-		
-				// Get the list of files at the start of this polling event
+
 				files, err := scanDirectoryWithPattern(fileURI, pattern)
 				if err != nil {
 					consolelogger.ErrorLog(fmt.Sprintf("Error scanning directory %s: %v", fileURI, err))
 					continue
 				}
-		
-				// Process each file
+
 				for _, file := range files {
 					wgChild.Add(1)
-					//have to test is it safe to make go routines for each file arbitrarily
-					// A solution may be put a threshold (eg:- 100 files) and then make go routines for each file.If the number of files is greater than the threshold make only upper limit (threshold) of go routines
-					go adapter.ProcessFile(newCtx,file, moveAfterProcess, moveAfterFailure)
+					consolelogger.InfoLog(fmt.Sprintf("Processing file: %s", file))
+					go adapter.ProcessFile(newCtx, file, moveAfterProcess, moveAfterFailure)
 				}
-		
-				// Ensure accurate polling interval
+
 				elapsed := time.Since(startTime)
-				if elapsed < time.Duration(interval)*time.Second {
-					time.Sleep(time.Duration(interval)*time.Second - elapsed)
+				if elapsed < time.Duration(interval)*time.Millisecond {
+					time.Sleep(time.Duration(interval)*time.Millisecond - elapsed)
 				}
+
+			case <-ctx.Done():
+				consolelogger.InfoLog("Cleaning up file polling gracefully")
+				wgChild.Wait()  // Wait for child goroutines before exiting
+				return nil
 			}
 		}
-		wgChild.Wait()
-		return nil
 	} else {
 		return errors.New("invalid protocol")
 	}
@@ -242,13 +239,14 @@ func processFailedFiles(inDir, failedDir string) {
 func scanDirectoryWithPattern(folderURI, pattern string) ([]string, error) {
 	// Convert file URI to absolute file path
 	folderPath, err := ConvertFileURIToPath(folderURI)
+
+	consolelogger.InfoLog(fmt.Sprintf("Scanning directory %s with pattern %s", folderPath, pattern))
 	if err != nil {
 		consolelogger.ErrorLog(fmt.Sprintf("Error converting file URI to path: %v", err))
 		return nil, err
 	}
 	
 	var files []string
-
 	entries, err := os.ReadDir(folderPath)
 	if err != nil {
 		return nil, err
@@ -262,10 +260,10 @@ func scanDirectoryWithPattern(folderURI, pattern string) ([]string, error) {
 				continue
 			}
 			if matched {
-				files = append(files, filepath.Join(folderPath, entry.Name()))
+				files = append(files, filepath.Join(folderURI, entry.Name()))
 			}
 		}
-			files = append(files, filepath.Join(folderPath, entry.Name()))
+			files = append(files, filepath.Join(folderURI, entry.Name()))
 	}
 	return files, nil
 }
@@ -340,27 +338,44 @@ func ReadFile(fileURI string) (*synapsecontext.SynapseContext, error) {
 		ClientApiNonBlocking: true,
 	}
 
+	// convert properties to map[string]string
+	propertiesMap,err := Convert(properties)
+	if err != nil {
+		consolelogger.ErrorLog(fmt.Sprintf("Error converting properties to map: %v", err))
+		return nil, err
+	}
+
+	headerMap,err := Convert(header)
+	if err != nil {
+		consolelogger.ErrorLog(fmt.Sprintf("Error converting header to map: %v", err))
+		return nil, err
+	}
+
 	// Read file content
 	content, err := io.ReadAll(file)
 	if err != nil {
 		consolelogger.ErrorLog(fmt.Sprintf("Error reading file %s: %v", filePath, err))
+
+
 		return &synapsecontext.SynapseContext{
-			Properties: structToMap(properties),
+			Properties: propertiesMap,
 			Message: synapsecontext.Message{
 				RawPayload:  nil,
 				ContentType: "text/plain",
 			},
-			Headers: structToMap(header),
+			Headers: headerMap,
 		}, err
 	}
 
+
+
 	return &synapsecontext.SynapseContext{
-		Properties: structToMap(properties),
+		Properties: propertiesMap,
 		Message: synapsecontext.Message{
 			RawPayload:  content,
 			ContentType: "text/plain",
 		},
-		Headers: structToMap(header),
+		Headers: headerMap,
 
 	}, nil
 }
@@ -401,22 +416,35 @@ func (f  *FileInboundAdapter) ProcessFile(ctx context.Context,file string, moveA
 
 }
 
-// Function to convert struct to map[string]string
-func structToMap(s interface{}) map[string]string {
-	result := make(map[string]string)
+//Convert converts a struct to a map for easy iteration with for range.
+//`struc` can be a pointer or a concrete struct.
+// error will be nil if everything worked.
+func Convert(struc interface{}) (map[string]string, error) {
 
-	// Get the type and value of the struct
-	v := reflect.ValueOf(s)
-	t := reflect.TypeOf(s)
+	returnMap := make(map[string]string)
 
-	// Iterate through struct fields
-	for i := 0; i < v.NumField(); i++ {
-		fieldName := t.Field(i).Name                       // Get field name
-		fieldValue := fmt.Sprintf("%v", v.Field(i).Interface()) // Convert field value to string
-		result[fieldName] = fieldValue
+	sType := getStructType(struc)
+
+	if sType.Kind() != reflect.Struct {
+		return returnMap, errors.New("variable given is not a struct or a pointer to a struct")
 	}
 
-	return result
+	for i := 0; i < sType.NumField(); i++ {
+		structFieldName := sType.Field(i).Name
+		structVal := reflect.ValueOf(struc)
+		returnMap[structFieldName] = structVal.FieldByName(structFieldName).String()
+	}
+
+	return returnMap, nil
+}
+
+func getStructType(struc interface{}) reflect.Type {
+	sType := reflect.TypeOf(struc)
+	if sType.Kind() == reflect.Ptr {
+		sType = sType.Elem()
+	}
+
+	return sType
 }
 
 type Properties struct {
@@ -489,8 +517,20 @@ func copyFile(source, destination string) error {
 func (f  *FileInboundAdapter) ReceiveResults(processedMessageFromCore ProcessedMessageFromCore, moveAfterProcess string, moveAfterFailure string) {
 	//reveive results
 	if processedMessageFromCore.IsSuccess {
+		startPath,err:= ConvertFileURIToPath(processedMessageFromCore.FilePath)
+		if err != nil {
+			consolelogger.ErrorLog(fmt.Sprintf("Error converting file URI to path: %v", err))
+			return
+		}
+
+		destinationPath,err := ConvertFileURIToPath(moveAfterProcess)
+		if err != nil {
+			consolelogger.ErrorLog(fmt.Sprintf("Error converting file URI to path: %v", err))
+			return
+		}
+
 		// Move file to success directory
-		err := MoveFile(processedMessageFromCore.FilePath, moveAfterProcess)
+		err = MoveFile(startPath, destinationPath)
 		if err != nil {
 			consolelogger.ErrorLog(fmt.Sprintf("Error moving file %s to %s: %v", processedMessageFromCore.FilePath, moveAfterProcess, err))
 		} else {
@@ -499,6 +539,12 @@ func (f  *FileInboundAdapter) ReceiveResults(processedMessageFromCore ProcessedM
 	} else {
 		// Write to failed_files.txt
 		failedFilePath := filepath.Join(moveAfterFailure, "failed_files.txt")
+		failedFilePath,err := ConvertFileURIToPath(failedFilePath)
+		if err != nil {
+			consolelogger.ErrorLog(fmt.Sprintf("Error converting file URI to path: %v", err))
+			return
+		}
+		
 		file, err := os.OpenFile(failedFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
 			consolelogger.ErrorLog(fmt.Sprintf("Error opening failed_files.txt: %v", err))
