@@ -113,7 +113,7 @@ func (adapter *FileInboundAdapter) PollFile(ctx context.Context) error {
 					waitgroup.Add(1)
 					//have to test is it safe to make go routines for each file arbitrarily
 					// A solution may be put a threshold (eg:- 100 files) and then make go routines for each file.If the number of files is greater than the threshold make only upper limit (threshold) of go routines
-					go adapter.ProcessFile(ctx,file)
+					go adapter.ProcessFile(ctx,file, moveAfterProcess, moveAfterFailure)
 				}
 		
 				// Ensure accurate polling interval
@@ -374,7 +374,7 @@ type ContextHeader struct {
 	FILE_NAME string
 }
 
-func (f *FileInboundAdapter) ProcessFile(ctx context.Context,file string) {
+func (f  *FileInboundAdapter) ProcessFile(ctx context.Context,file string, moveAfterProcess string, moveAfterFailure string) {
 	waitgroup := ctx.Value("waitGroup").(*sync.WaitGroup)
 	defer waitgroup.Done()
 	synapsecontext, err := ReadFile(file)
@@ -385,9 +385,13 @@ func (f *FileInboundAdapter) ProcessFile(ctx context.Context,file string) {
 	
 	// creating the mediation engine instance and mediating the sequence
 	mediationEngine := mediationengine.GetMediationEngine()
-	mediationEngine.MediateNamedSequence("inboundSeq", synapsecontext, ctx)
+	mediationEngine.MediateNamedSequence("inboundSeq", synapsecontext, ctx) // Inside medationengine ReceiveResults should be called
 
 	//Attention : Here I implemented considering same reading go routine taking care the receiving results and it is needed to reconsider the design. Here the design is simpple but think the situation where some of the processed results of the previous iteration coming and there might be not enough threads.
+	
+	//The current plan is to call ReceiveResults from the core. ProcessedMessageFromCore will be sent from core to fileInboundAdapter representing the status of the previous message contexts that has being sent from adapter. This need to be more organized including the error logs while parsing the message after completing the core in future
+	// Also pay attention that receiveResults should be called before input the msgContext into sequence. ProcesssedMessageFromCore is a result of just building the xml (not at the end of the sequence)
+	f.ReceiveResults(ProcessedMessageFromCore{FilePath: file, IsSuccess: true}, moveAfterProcess, moveAfterFailure)
 
 
 }
@@ -415,4 +419,100 @@ type Properties struct {
 	ARTIFACT_NAME string
 	inboundEndpointName string
 	ClientApiNonBlocking bool
+}
+
+// MoveFile moves a file from source to destination, handling cross-filesystem moves.
+func MoveFile(source, destination string) error {
+	// Check if the destination is a directory
+	info, err := os.Stat(destination)
+	if err == nil && info.IsDir() {
+		// Extract the filename from the source path
+		filename := filepath.Base(source)
+		// Append the filename to the destination directory
+		destination = filepath.Join(destination, filename)
+	}
+
+	// Try to rename first (fast path)
+	err = os.Rename(source, destination)
+	if err == nil {
+		return nil // Successfully renamed (same file system)
+	}
+
+	// If rename fails, assume it's due to a cross-filesystem issue and proceed with copy & delete
+	err = copyFile(source, destination)
+	if err != nil {
+		return fmt.Errorf("failed to copy file: %w", err)
+	}
+
+	// Remove the original file after successful copy
+	err = os.Remove(source)
+	if err != nil {
+		return fmt.Errorf("failed to remove source file: %w", err)
+	}
+
+	return nil
+}
+
+// copyFile copies the contents of the source file to the destination file.
+func copyFile(source, destination string) error {
+	srcFile, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	destFile, err := os.Create(destination)
+	if err != nil {
+		return err
+	}
+	defer destFile.Close()
+
+	_, err = io.Copy(destFile, srcFile)
+	if err != nil {
+		return err
+	}
+
+	// Ensure the new file has the same permissions as the source file
+	srcInfo, err := os.Stat(source)
+	if err != nil {
+		return err
+	}
+	return os.Chmod(destination, srcInfo.Mode())
+}
+
+//After receiving the results from core this function will move the file if it's success or write to failed_files.txt if it's failure
+func (f  *FileInboundAdapter) ReceiveResults(processedMessageFromCore ProcessedMessageFromCore, moveAfterProcess string, moveAfterFailure string) {
+	//reveive results
+	if processedMessageFromCore.IsSuccess {
+		// Move file to success directory
+		err := MoveFile(processedMessageFromCore.FilePath, moveAfterProcess)
+		if err != nil {
+			consolelogger.ErrorLog(fmt.Sprintf("Error moving file %s to %s: %v", processedMessageFromCore.FilePath, moveAfterProcess, err))
+		} else {
+			consolelogger.DebugLog(fmt.Sprint("Moved %s to %s\n", processedMessageFromCore.FilePath, moveAfterProcess))
+		}
+	} else {
+		// Write to failed_files.txt
+		failedFilePath := filepath.Join(moveAfterFailure, "failed_files.txt")
+		file, err := os.OpenFile(failedFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			consolelogger.ErrorLog(fmt.Sprintf("Error opening failed_files.txt: %v", err))
+			return
+		}
+		defer file.Close()
+
+		if _, err := file.WriteString(processedMessageFromCore.FilePath + "\n"); err != nil {
+			consolelogger.ErrorLog(fmt.Sprintf("Error writing to failed_files.txt: %v", err))
+		} else {
+			consolelogger.DebugLog(fmt.Sprintf("Wrote %s to failed_files.txt\n", processedMessageFromCore.FilePath))
+		}
+	}
+
+}
+
+// Message sending from core to fileInboundAdapter representing the status of the previous message contexts that has being sent from adapter. 
+// This need to be more organized including the error logs while parsing the message after completing the core in future
+type ProcessedMessageFromCore struct {
+	FilePath string
+	IsSuccess bool
 }
