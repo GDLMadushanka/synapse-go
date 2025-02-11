@@ -58,6 +58,8 @@ func Run(ctx context.Context) error {
 	// waiting for OS singals to shutdown
 
 	<-ctx.Done()
+	consolelogger.InfoLog("Received shutdown signal, cleaning up...")
+	// fmt.Println("\nReceived shutdown signal, cleaning up...") need to write cleaning up process
 	wg.Wait()
 	consolelogger.InfoLog("Server stopped")
 	return nil

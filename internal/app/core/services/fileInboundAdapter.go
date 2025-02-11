@@ -14,11 +14,19 @@ limitations under the License.
 package services
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
+	"reflect"
 
 	"strconv"
 
@@ -33,9 +41,15 @@ type FileInboundAdapter struct {
 }
 
 func (adapter *FileInboundAdapter) PollFile(ctx context.Context) error {
+	consolelogger.InfoLog("PollFile called")
 	waitgroup := ctx.Value("waitGroup").(*sync.WaitGroup)
+	defer waitgroup.Done()
+
+	var wgChild sync.WaitGroup
+	newCtx := context.WithValue(ctx, "waitGroup", &wgChild)
+
 	if adapter.inbound.Protocol == "file" {
-		var fileContent = "Hello World"
+
 		interval, found := getIntervalParameterValue(adapter.inbound)
 		if found {
 			consolelogger.InfoLog(fmt.Sprintf("Polling file every %d milliseconds", interval))
@@ -44,33 +58,79 @@ func (adapter *FileInboundAdapter) PollFile(ctx context.Context) error {
 			return errors.New("interval parameter not found")
 		}
 
+		fileURI, found := getFileURIParameterValue(adapter.inbound)
+		if found {
+			consolelogger.InfoLog(fmt.Sprintf("File URI: %s", fileURI))
+		} else {
+			consolelogger.ErrorLog("File URI parameter not found")
+			return errors.New("file URI parameter not found")
+		}
+
+		moveAfterFailure, found := getMoveAfterFailureParameterValue(adapter.inbound)
+		if found {
+			consolelogger.InfoLog(fmt.Sprintf("Move after failure: %s", moveAfterFailure))
+		} else {
+			consolelogger.ErrorLog("Move after failure parameter not found")
+			return errors.New("move after failure parameter not found")
+		}
+
+		moveAfterProcess, found := getMoveAfterProcessParameterValue(adapter.inbound)
+		if found {
+			consolelogger.InfoLog(fmt.Sprintf("Move after process: %s", moveAfterProcess))
+		} else {
+			consolelogger.ErrorLog("Move after process parameter not found")
+			return errors.New("move after process parameter not found")
+		}
+
+		pattern, found := getFileNamePatternParameterValue(adapter.inbound)
+		if found {
+			consolelogger.InfoLog(fmt.Sprintf("File name pattern: %s", pattern))
+		} else {
+			consolelogger.ErrorLog("File name pattern parameter not found")
+			return errors.New("file name pattern parameter not found")
+		}
+
+		ticker := time.NewTicker(time.Duration(interval) * time.Millisecond)
+		defer ticker.Stop()  // Ensures cleanup
+
+		consolelogger.InfoLog("Starting file polling loop")
+
 		for {
+			consolelogger.InfoLog("Polling event")
 			select {
-			case <-ctx.Done():
-				waitgroup.Done()
-				fmt.Println("Cleaning up file polling gracefully")
-				consolelogger.InfoLog("Cleaning up file polling gracefully")
-				return nil
-			default:
-				consolelogger.DebugLog("Polling file")
-				// Creating the new message context from file content
-				var context = synapsecontext.SynapseContext{
-					Properties: make(map[string]string),
-					Message: synapsecontext.Message{
-						RawPayload:  []byte(fileContent),
-						ContentType: "text/plain",
-					},
-					Headers: make(map[string]string),
+			case t := <-ticker.C:
+				consolelogger.InfoLog(fmt.Sprintf("Polling event at: %v", t))
+				startTime := time.Now()
+
+				processFailedFiles(fileURI, moveAfterFailure)
+
+				files, err := scanDirectoryWithPattern(fileURI, pattern)
+				if err != nil {
+					consolelogger.ErrorLog(fmt.Sprintf("Error scanning directory %s: %v", fileURI, err))
+					continue
 				}
-				// creating the mediation engine instance and mediating the sequence
-				mediationEngine := mediationengine.GetMediationEngine()
-				mediationEngine.MediateNamedSequence("inboundSeq", &context, ctx)
+
+				for _, file := range files {
+					wgChild.Add(1)
+					consolelogger.InfoLog(fmt.Sprintf("Processing file: %s", file))
+					go adapter.ProcessFile(newCtx, file, moveAfterProcess, moveAfterFailure)
+				}
+
+				elapsed := time.Since(startTime)
+				if elapsed < time.Duration(interval)*time.Millisecond {
+					time.Sleep(time.Duration(interval)*time.Millisecond - elapsed)
+				}
+
+			case <-ctx.Done():
+				consolelogger.InfoLog("Cleaning up file polling gracefully")
+				wgChild.Wait()  // Wait for child goroutines before exiting
+				return nil
 			}
-			time.Sleep(time.Duration(interval) * time.Millisecond)
 		}
 	} else {
 		return errors.New("invalid protocol")
 	}
+
 }
 
 func GetInstance(inbound artifacts.Inbound) (FileInboundAdapter, error) {
@@ -93,4 +153,417 @@ func getIntervalParameterValue(inbound artifacts.Inbound) (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+func getFileURIParameterValue(inbound artifacts.Inbound) (string, bool) {
+	for _, p := range inbound.Parameters {
+		if p.Name == "transport.vfs.FileURI" {
+			return p.Value, true
+		}
+	}
+	return "", false
+}
+
+func getMoveAfterFailureParameterValue(inbound artifacts.Inbound) (string, bool) {
+	for _, p := range inbound.Parameters {
+		if p.Name == "transport.vfs.MoveAfterFailure" {
+			return p.Value, true
+		}
+	}
+	return "", false
+}
+
+func getMoveAfterProcessParameterValue(inbound artifacts.Inbound) (string, bool) {
+	for _, p := range inbound.Parameters {
+		if p.Name == "transport.vfs.MoveAfterProcess" {
+			return p.Value, true
+		}
+	}
+	return "", false
+}
+
+func getFileNamePatternParameterValue(inbound artifacts.Inbound) (string, bool) {
+	for _, p := range inbound.Parameters {
+		if p.Name == "transport.vfs.FileNamePattern" {
+			return p.Value, true
+		}
+	}
+	return "", false
+}
+
+// Moves failed files from `test/in/` to `test/failed/`. test/failed/failed_files.txt contains the list of failed files.
+func processFailedFiles(inDir, failedDir string) {
+	// Path to failed_files.txt
+	failedFilePath := filepath.Join(failedDir, "failed_files.txt")
+
+	// Open failed_files.txt if it exists
+	file, err := os.Open(failedFilePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			consolelogger.DebugLog("No failed_files.txt found, skipping.")
+			return
+		}
+		consolelogger.ErrorLog(fmt.Sprintf("Error opening %s: %v", failedFilePath, err))
+		return
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		failedFile := scanner.Text()
+		sourcePath := filepath.Join(inDir, failedFile)
+		destPath := filepath.Join(failedDir, failedFile)
+
+		// Move the failed file to the failed directory
+		err := os.Rename(sourcePath, destPath)
+		if err != nil {
+			consolelogger.ErrorLog(fmt.Sprintf("Error moving %s to failed folder: %v", sourcePath, err))
+		} else {
+			consolelogger.DebugLog(fmt.Sprintf("Moved %s to failed folder\n", failedFile))
+		}
+	}
+
+	// Handle scanning errors
+	if err := scanner.Err(); err != nil {
+		consolelogger.ErrorLog(fmt.Sprintf("Error reading failed_files.txt: %v", err))
+	}
+
+	// Remove failed_files.txt after processing
+	err = os.Remove(failedFilePath)
+	if err != nil {
+		consolelogger.ErrorLog(fmt.Sprintf("Error deleting failed_files.txt: %v", err))
+	}
+}
+
+// Scan a directory and return the list of files matching the given pattern
+func scanDirectoryWithPattern(folderURI, pattern string) ([]string, error) {
+	// Convert file URI to absolute file path
+	folderPath, err := ConvertFileURIToPath(folderURI)
+
+	consolelogger.InfoLog(fmt.Sprintf("Scanning directory %s with pattern %s", folderPath, pattern))
+	if err != nil {
+		consolelogger.ErrorLog(fmt.Sprintf("Error converting file URI to path: %v", err))
+		return nil, err
+	}
+	
+	var files []string
+	entries, err := os.ReadDir(folderPath)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			matched, err := filepath.Match(pattern, entry.Name()) // Match file pattern
+			if err != nil {
+				consolelogger.ErrorLog(fmt.Sprint("Error matching pattern %s: %v", pattern, err))
+				continue
+			}
+			if matched {
+				files = append(files, filepath.Join(folderURI, entry.Name()))
+			}
+		}
+			files = append(files, filepath.Join(folderURI, entry.Name()))
+	}
+	return files, nil
+}
+
+// ConvertFileURIToPath converts a file:// URI to an absolute file path.
+func ConvertFileURIToPath(fileURI string) (string, error) {
+	// Parse the file URI
+	parsedURI, err := url.Parse(fileURI)
+	if err != nil {
+		consolelogger.ErrorLog(fmt.Sprintf("invalid file URI: %v", err))
+		return "", err
+	}
+
+	// Ensure scheme is "file"
+	if parsedURI.Scheme != "file" {
+		consolelogger.ErrorLog(fmt.Sprintf("unsupported URI scheme: %s", parsedURI.Scheme))
+		return "", fmt.Errorf("unsupported URI scheme: %s", parsedURI.Scheme)
+	}
+
+	// Get the file path and decode any URL encoding (e.g., spaces as `%20`)
+	filePath := parsedURI.Path
+	filePath = filepath.Clean(filePath)
+	filePath = strings.ReplaceAll(filePath, "%20", " ") // Handle spaces
+
+	return filePath, nil
+}
+
+// ReadFile reads a file, extracts metadata, locks it, and returns the extracted data.
+func ReadFile(fileURI string) (*synapsecontext.SynapseContext, error) {
+	// Convert file URI to absolute file path
+	filePath, err := ConvertFileURIToPath(fileURI)
+	if err != nil {
+		consolelogger.ErrorLog(fmt.Sprintf("Error converting file URI to path: %v", err))
+		return nil, err
+	}
+
+	// Open the file
+	file, err := os.Open(filePath)
+	if err != nil {
+		consolelogger.ErrorLog(fmt.Sprintf("Error opening file %s: %v", filePath, err))
+		return nil, err
+	}
+	defer file.Close()
+
+	// Lock the file to prevent modifications
+	err = syscall.Flock(int(file.Fd()), syscall.LOCK_EX) // Exclusive lock
+	if err != nil {
+		consolelogger.ErrorLog(fmt.Sprintf("Error locking file %s: %v", filePath, err))
+		return nil, err
+	}
+
+	// Get file metadata
+	info, err := file.Stat()
+	if err != nil {
+		consolelogger.ErrorLog(fmt.Sprintf("Error getting file info for %s: %v", filePath, err))
+		return nil, err
+	}
+
+	// Extract metadata into ContextHeader
+	header := ContextHeader{
+		FILE_LENGTH:   float64(info.Size()),
+		LAST_MODIFIED: float64(info.ModTime().Unix()), // Convert to Unix timestamp
+		FILE_URI:      fileURI,                        // Keep original FILE_URI
+		FILE_PATH:     filePath,                       // Derived file path
+		FILE_NAME:     info.Name(),
+	}
+
+	properties := Properties{
+		isInbound: true,
+		ARTIFACT_NAME: "inboundendpointfile",
+		inboundEndpointName: "file",
+		ClientApiNonBlocking: true,
+	}
+
+	// convert properties to map[string]string
+	propertiesMap,err := Convert(properties)
+	if err != nil {
+		consolelogger.ErrorLog(fmt.Sprintf("Error converting properties to map: %v", err))
+		return nil, err
+	}
+
+	headerMap,err := Convert(header)
+	if err != nil {
+		consolelogger.ErrorLog(fmt.Sprintf("Error converting header to map: %v", err))
+		return nil, err
+	}
+
+	// Read file content
+	content, err := io.ReadAll(file)
+	if err != nil {
+		consolelogger.ErrorLog(fmt.Sprintf("Error reading file %s: %v", filePath, err))
+
+
+		return &synapsecontext.SynapseContext{
+			Properties: propertiesMap,
+			Message: synapsecontext.Message{
+				RawPayload:  nil,
+				ContentType: "text/plain",
+			},
+			Headers: headerMap,
+		}, err
+	}
+
+
+
+	return &synapsecontext.SynapseContext{
+		Properties: propertiesMap,
+		Message: synapsecontext.Message{
+			RawPayload:  content,
+			ContentType: "text/plain",
+		},
+		Headers: headerMap,
+
+	}, nil
+}
+
+//In original code this is FileObject
+type ExtractedFileDataFromFileAdapter struct {
+	ContextHeader
+	Context string
+}
+
+type ContextHeader struct {
+	FILE_LENGTH float64
+	LAST_MODIFIED float64
+	FILE_URI string
+	FILE_PATH string
+	FILE_NAME string
+}
+
+func (f  *FileInboundAdapter) ProcessFile(ctx context.Context,file string, moveAfterProcess string, moveAfterFailure string) {
+	waitgroup := ctx.Value("waitGroup").(*sync.WaitGroup)
+	defer waitgroup.Done()
+	synapsecontext, err := ReadFile(file)
+	if err != nil {
+		consolelogger.ErrorLog(fmt.Sprintf("Error reading file %s: %v", file, err))
+		return
+	}
+	
+	// creating the mediation engine instance and mediating the sequence
+	mediationEngine := mediationengine.GetMediationEngine()
+	mediationEngine.MediateNamedSequence("inboundSeq", synapsecontext, ctx) // Inside medationengine ReceiveResults should be called
+
+	//Attention : Here I implemented considering same reading go routine taking care the receiving results and it is needed to reconsider the design. Here the design is simpple but think the situation where some of the processed results of the previous iteration coming and there might be not enough threads.
+	
+	//The current plan is to call ReceiveResults from the core. ProcessedMessageFromCore will be sent from core to fileInboundAdapter representing the status of the previous message contexts that has being sent from adapter. This need to be more organized including the error logs while parsing the message after completing the core in future
+	// Also pay attention that receiveResults should be called before input the msgContext into sequence. ProcesssedMessageFromCore is a result of just building the xml (not at the end of the sequence)
+	f.ReceiveResults(ProcessedMessageFromCore{FilePath: file, IsSuccess: true}, moveAfterProcess, moveAfterFailure)
+
+
+}
+
+//Convert converts a struct to a map for easy iteration with for range.
+//`struc` can be a pointer or a concrete struct.
+// error will be nil if everything worked.
+func Convert(struc interface{}) (map[string]string, error) {
+
+	returnMap := make(map[string]string)
+
+	sType := getStructType(struc)
+
+	if sType.Kind() != reflect.Struct {
+		return returnMap, errors.New("variable given is not a struct or a pointer to a struct")
+	}
+
+	for i := 0; i < sType.NumField(); i++ {
+		structFieldName := sType.Field(i).Name
+		structVal := reflect.ValueOf(struc)
+		returnMap[structFieldName] = structVal.FieldByName(structFieldName).String()
+	}
+
+	return returnMap, nil
+}
+
+func getStructType(struc interface{}) reflect.Type {
+	sType := reflect.TypeOf(struc)
+	if sType.Kind() == reflect.Ptr {
+		sType = sType.Elem()
+	}
+
+	return sType
+}
+
+type Properties struct {
+	isInbound bool
+	ARTIFACT_NAME string
+	inboundEndpointName string
+	ClientApiNonBlocking bool
+}
+
+// MoveFile moves a file from source to destination, handling cross-filesystem moves.
+func MoveFile(source, destination string) error {
+	// Check if the destination is a directory
+	info, err := os.Stat(destination)
+	if err == nil && info.IsDir() {
+		// Extract the filename from the source path
+		filename := filepath.Base(source)
+		// Append the filename to the destination directory
+		destination = filepath.Join(destination, filename)
+	}
+
+	// Try to rename first (fast path)
+	err = os.Rename(source, destination)
+	if err == nil {
+		return nil // Successfully renamed (same file system)
+	}
+
+	// If rename fails, assume it's due to a cross-filesystem issue and proceed with copy & delete
+	err = copyFile(source, destination)
+	if err != nil {
+		return fmt.Errorf("failed to copy file: %w", err)
+	}
+
+	// Remove the original file after successful copy
+	err = os.Remove(source)
+	if err != nil {
+		return fmt.Errorf("failed to remove source file: %w", err)
+	}
+
+	return nil
+}
+
+// copyFile copies the contents of the source file to the destination file.
+func copyFile(source, destination string) error {
+	srcFile, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	destFile, err := os.Create(destination)
+	if err != nil {
+		return err
+	}
+	defer destFile.Close()
+
+	_, err = io.Copy(destFile, srcFile)
+	if err != nil {
+		return err
+	}
+
+	// Ensure the new file has the same permissions as the source file
+	srcInfo, err := os.Stat(source)
+	if err != nil {
+		return err
+	}
+	return os.Chmod(destination, srcInfo.Mode())
+}
+
+//After receiving the results from core this function will move the file if it's success or write to failed_files.txt if it's failure
+func (f  *FileInboundAdapter) ReceiveResults(processedMessageFromCore ProcessedMessageFromCore, moveAfterProcess string, moveAfterFailure string) {
+	//reveive results
+	if processedMessageFromCore.IsSuccess {
+		startPath,err:= ConvertFileURIToPath(processedMessageFromCore.FilePath)
+		if err != nil {
+			consolelogger.ErrorLog(fmt.Sprintf("Error converting file URI to path: %v", err))
+			return
+		}
+
+		destinationPath,err := ConvertFileURIToPath(moveAfterProcess)
+		if err != nil {
+			consolelogger.ErrorLog(fmt.Sprintf("Error converting file URI to path: %v", err))
+			return
+		}
+
+		// Move file to success directory
+		err = MoveFile(startPath, destinationPath)
+		if err != nil {
+			consolelogger.ErrorLog(fmt.Sprintf("Error moving file %s to %s: %v", processedMessageFromCore.FilePath, moveAfterProcess, err))
+		} else {
+			consolelogger.DebugLog(fmt.Sprint("Moved %s to %s\n", processedMessageFromCore.FilePath, moveAfterProcess))
+		}
+	} else {
+		// Write to failed_files.txt
+		failedFilePath := filepath.Join(moveAfterFailure, "failed_files.txt")
+		failedFilePath,err := ConvertFileURIToPath(failedFilePath)
+		if err != nil {
+			consolelogger.ErrorLog(fmt.Sprintf("Error converting file URI to path: %v", err))
+			return
+		}
+		
+		file, err := os.OpenFile(failedFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			consolelogger.ErrorLog(fmt.Sprintf("Error opening failed_files.txt: %v", err))
+			return
+		}
+		defer file.Close()
+
+		if _, err := file.WriteString(processedMessageFromCore.FilePath + "\n"); err != nil {
+			consolelogger.ErrorLog(fmt.Sprintf("Error writing to failed_files.txt: %v", err))
+		} else {
+			consolelogger.DebugLog(fmt.Sprintf("Wrote %s to failed_files.txt\n", processedMessageFromCore.FilePath))
+		}
+	}
+
+}
+
+// Message sending from core to fileInboundAdapter representing the status of the previous message contexts that has being sent from adapter. 
+// This need to be more organized including the error logs while parsing the message after completing the core in future
+type ProcessedMessageFromCore struct {
+	FilePath string
+	IsSuccess bool
 }
