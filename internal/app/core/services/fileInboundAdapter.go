@@ -42,6 +42,11 @@ type FileInboundAdapter struct {
 
 func (adapter *FileInboundAdapter) PollFile(ctx context.Context) error {
 	waitgroup := ctx.Value("waitGroup").(*sync.WaitGroup)
+	defer waitgroup.Done()
+
+	var wgChild sync.WaitGroup
+	newCtx := context.WithValue(ctx, "waitGroup", wgChild)
+
 	if adapter.inbound.Protocol == "file" {
 
 		interval, found := getIntervalParameterValue(adapter.inbound)
@@ -110,10 +115,10 @@ func (adapter *FileInboundAdapter) PollFile(ctx context.Context) error {
 		
 				// Process each file
 				for _, file := range files {
-					waitgroup.Add(1)
+					wgChild.Add(1)
 					//have to test is it safe to make go routines for each file arbitrarily
 					// A solution may be put a threshold (eg:- 100 files) and then make go routines for each file.If the number of files is greater than the threshold make only upper limit (threshold) of go routines
-					go adapter.ProcessFile(ctx,file, moveAfterProcess, moveAfterFailure)
+					go adapter.ProcessFile(newCtx,file, moveAfterProcess, moveAfterFailure)
 				}
 		
 				// Ensure accurate polling interval
@@ -123,7 +128,7 @@ func (adapter *FileInboundAdapter) PollFile(ctx context.Context) error {
 				}
 			}
 		}
-		waitgroup.Wait()
+		wgChild.Wait()
 		return nil
 	} else {
 		return errors.New("invalid protocol")
